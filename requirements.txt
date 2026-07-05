@@ -6,6 +6,7 @@
 numpy==1.26.4
 pandas==2.2.2
 yfinance==0.2.44
+curl_cffi==0.7.3
 
 # Machine Learning / Deep Learning
 tensorflow==2.16.1        # includes Keras 3
