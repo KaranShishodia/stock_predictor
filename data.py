@@ -16,12 +16,14 @@ Usage (standalone)
 """
 
 import argparse
+import io
 import pickle
 import time
 import warnings
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 
@@ -34,13 +36,39 @@ warnings.filterwarnings("ignore")
 # Data fetching
 # ---------------------------------------------------------------------------
 
+def _fetch_from_stooq(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """Fallback data source: Stooq's free CSV endpoint.
+
+    Stooq doesn't block cloud/datacenter IPs the way Yahoo Finance does,
+    so this is used when yfinance fails entirely (common on Streamlit
+    Cloud, Render, Heroku, etc.). US tickers need a ".us" suffix.
+    """
+    symbol = ticker.lower()
+    if "." not in symbol:
+        symbol += ".us"
+
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+
+    df = pd.read_csv(io.StringIO(resp.text))
+    if df.empty or "Date" not in df.columns:
+        return pd.DataFrame()
+
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.set_index("Date", inplace=True)
+    df = df.loc[(df.index >= start_date) & (df.index <= end_date)]
+    return df
+
+
 def fetch_stock_data(
     ticker: str,
     start_date: str,
     end_date: str,
     max_retries: int = 3,
 ) -> pd.DataFrame:
-    """Download historical OHLCV data from Yahoo Finance.
+    """Download historical OHLCV data, trying Yahoo Finance first and
+    falling back to Stooq if Yahoo is unavailable/blocked.
 
     Parameters
     ----------
@@ -51,8 +79,7 @@ def fetch_stock_data(
     end_date : str
         Exclusive end date, ``"YYYY-MM-DD"`` format.
     max_retries : int
-        Number of attempts before giving up (cloud IPs get rate-limited
-        by Yahoo Finance more often than local/residential IPs).
+        Number of yfinance attempts before falling back to Stooq.
 
     Returns
     -------
@@ -62,7 +89,7 @@ def fetch_stock_data(
     Raises
     ------
     ValueError
-        If yfinance returns an empty DataFrame after all retries.
+        If both Yahoo Finance and Stooq fail to return data.
     """
     print(f"[data] Downloading {ticker} from {start_date} to {end_date}...")
 
@@ -71,7 +98,6 @@ def fetch_stock_data(
 
     for attempt in range(1, max_retries + 1):
         try:
-            # Primary method
             df = yf.download(
                 ticker,
                 start=start_date,
@@ -83,8 +109,6 @@ def fetch_stock_data(
             if not df.empty:
                 break
 
-            # Fallback method — Ticker().history() uses a different
-            # endpoint and sometimes succeeds when download() is blocked.
             df = yf.Ticker(ticker).history(
                 start=start_date, end=end_date, auto_adjust=True
             )
@@ -96,15 +120,21 @@ def fetch_stock_data(
 
         if attempt < max_retries:
             wait = 2 * attempt
-            print(f"[data] Attempt {attempt} failed, retrying in {wait}s...")
+            print(f"[data] Yahoo attempt {attempt} failed, retrying in {wait}s...")
             time.sleep(wait)
+
+    # Yahoo Finance failed after all retries — try Stooq instead.
+    if df.empty:
+        print("[data] Yahoo Finance unavailable, falling back to Stooq...")
+        try:
+            df = _fetch_from_stooq(ticker, start_date, end_date)
+        except Exception as e:
+            last_err = e
 
     if df.empty:
         msg = (
-            f"No data returned for ticker '{ticker}' after {max_retries} "
-            "attempts. This can happen if Yahoo Finance is temporarily "
-            "rate-limiting this server's IP (common on cloud hosts), or "
-            "the symbol/date range is invalid."
+            f"No data returned for ticker '{ticker}' from either Yahoo "
+            "Finance or Stooq. Check the symbol and date range."
         )
         if last_err:
             msg += f" Last error: {last_err}"
