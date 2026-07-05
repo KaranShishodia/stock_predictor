@@ -17,6 +17,7 @@ Usage (standalone)
 
 import argparse
 import pickle
+import time
 import warnings
 
 import numpy as np
@@ -37,6 +38,7 @@ def fetch_stock_data(
     ticker: str,
     start_date: str,
     end_date: str,
+    max_retries: int = 3,
 ) -> pd.DataFrame:
     """Download historical OHLCV data from Yahoo Finance.
 
@@ -48,6 +50,9 @@ def fetch_stock_data(
         Inclusive start date, ``"YYYY-MM-DD"`` format.
     end_date : str
         Exclusive end date, ``"YYYY-MM-DD"`` format.
+    max_retries : int
+        Number of attempts before giving up (cloud IPs get rate-limited
+        by Yahoo Finance more often than local/residential IPs).
 
     Returns
     -------
@@ -57,16 +62,53 @@ def fetch_stock_data(
     Raises
     ------
     ValueError
-        If yfinance returns an empty DataFrame (bad ticker or range).
+        If yfinance returns an empty DataFrame after all retries.
     """
     print(f"[data] Downloading {ticker} from {start_date} to {end_date}...")
-    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+
+    df = pd.DataFrame()
+    last_err = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Primary method
+            df = yf.download(
+                ticker,
+                start=start_date,
+                end=end_date,
+                progress=False,
+                auto_adjust=True,
+                threads=False,
+            )
+            if not df.empty:
+                break
+
+            # Fallback method — Ticker().history() uses a different
+            # endpoint and sometimes succeeds when download() is blocked.
+            df = yf.Ticker(ticker).history(
+                start=start_date, end=end_date, auto_adjust=True
+            )
+            if not df.empty:
+                break
+
+        except Exception as e:
+            last_err = e
+
+        if attempt < max_retries:
+            wait = 2 * attempt
+            print(f"[data] Attempt {attempt} failed, retrying in {wait}s...")
+            time.sleep(wait)
 
     if df.empty:
-        raise ValueError(
-            f"No data returned for ticker '{ticker}'. "
-            "Check the symbol and date range."
+        msg = (
+            f"No data returned for ticker '{ticker}' after {max_retries} "
+            "attempts. This can happen if Yahoo Finance is temporarily "
+            "rate-limiting this server's IP (common on cloud hosts), or "
+            "the symbol/date range is invalid."
         )
+        if last_err:
+            msg += f" Last error: {last_err}"
+        raise ValueError(msg)
 
     # yfinance sometimes returns MultiIndex columns — flatten them
     if isinstance(df.columns, pd.MultiIndex):
