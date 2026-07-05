@@ -36,39 +36,19 @@ warnings.filterwarnings("ignore")
 # Data fetching
 # ---------------------------------------------------------------------------
 
-def _fetch_from_stooq(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    """Fallback data source: Stooq's free CSV endpoint.
-
-    Stooq doesn't block cloud/datacenter IPs the way Yahoo Finance does,
-    so this is used when yfinance fails entirely (common on Streamlit
-    Cloud, Render, Heroku, etc.). US tickers need a ".us" suffix.
-    """
-    symbol = ticker.lower()
-    if "." not in symbol:
-        symbol += ".us"
-
-    url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-
-    df = pd.read_csv(io.StringIO(resp.text))
-    if df.empty or "Date" not in df.columns:
-        return pd.DataFrame()
-
-    df["Date"] = pd.to_datetime(df["Date"])
-    df.set_index("Date", inplace=True)
-    df = df.loc[(df.index >= start_date) & (df.index <= end_date)]
-    return df
-
-
 def fetch_stock_data(
     ticker: str,
     start_date: str,
     end_date: str,
     max_retries: int = 3,
 ) -> pd.DataFrame:
-    """Download historical OHLCV data, trying Yahoo Finance first and
-    falling back to Stooq if Yahoo is unavailable/blocked.
+    """Download historical OHLCV data from Yahoo Finance.
+
+    yfinance (>=0.2.41) automatically uses curl_cffi's browser-impersonating
+    HTTP client internally if the package is installed — it manages its own
+    cookies/crumb token for Yahoo's auth handshake. We deliberately do NOT
+    pass a custom session here: doing so bypasses yfinance's internal
+    crumb management and causes empty/invalid JSON responses from Yahoo.
 
     Parameters
     ----------
@@ -79,7 +59,7 @@ def fetch_stock_data(
     end_date : str
         Exclusive end date, ``"YYYY-MM-DD"`` format.
     max_retries : int
-        Number of yfinance attempts before falling back to Stooq.
+        Number of attempts before giving up.
 
     Returns
     -------
@@ -89,7 +69,7 @@ def fetch_stock_data(
     Raises
     ------
     ValueError
-        If both Yahoo Finance and Stooq fail to return data.
+        If yfinance returns an empty DataFrame after all retries.
     """
     print(f"[data] Downloading {ticker} from {start_date} to {end_date}...")
 
@@ -98,20 +78,8 @@ def fetch_stock_data(
 
     for attempt in range(1, max_retries + 1):
         try:
-            df = yf.download(
-                ticker,
-                start=start_date,
-                end=end_date,
-                progress=False,
-                auto_adjust=True,
-                threads=False,
-            )
-            if not df.empty:
-                break
-
-            df = yf.Ticker(ticker).history(
-                start=start_date, end=end_date, auto_adjust=True
-            )
+            tk = yf.Ticker(ticker)
+            df = tk.history(start=start_date, end=end_date, auto_adjust=True)
             if not df.empty:
                 break
 
@@ -119,22 +87,15 @@ def fetch_stock_data(
             last_err = e
 
         if attempt < max_retries:
-            wait = 2 * attempt
-            print(f"[data] Yahoo attempt {attempt} failed, retrying in {wait}s...")
+            wait = 3 * attempt
+            print(f"[data] Attempt {attempt} failed, retrying in {wait}s...")
             time.sleep(wait)
-
-    # Yahoo Finance failed after all retries — try Stooq instead.
-    if df.empty:
-        print("[data] Yahoo Finance unavailable, falling back to Stooq...")
-        try:
-            df = _fetch_from_stooq(ticker, start_date, end_date)
-        except Exception as e:
-            last_err = e
 
     if df.empty:
         msg = (
-            f"No data returned for ticker '{ticker}' from either Yahoo "
-            "Finance or Stooq. Check the symbol and date range."
+            f"No data returned for ticker '{ticker}' after {max_retries} "
+            "attempts. Yahoo Finance may be blocking this server, or the "
+            "symbol/date range is invalid."
         )
         if last_err:
             msg += f" Last error: {last_err}"
