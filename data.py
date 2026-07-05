@@ -17,6 +17,7 @@ Usage (standalone)
 
 import argparse
 import io
+import os
 import pickle
 import time
 import warnings
@@ -36,19 +37,66 @@ warnings.filterwarnings("ignore")
 # Data fetching
 # ---------------------------------------------------------------------------
 
+def _fetch_from_twelvedata(
+    ticker: str, start_date: str, end_date: str, api_key: str
+) -> pd.DataFrame:
+    """Fetch OHLCV data from Twelve Data's REST API.
+
+    Twelve Data is built for programmatic/server access and does not block
+    cloud/datacenter IPs the way Yahoo Finance does. Free tier: 800
+    requests/day, 8/minute — get a free key at https://twelvedata.com.
+    """
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": ticker,
+        "interval": "1day",
+        "start_date": start_date,
+        "end_date": end_date,
+        "outputsize": 5000,
+        "apikey": api_key,
+        "format": "JSON",
+    }
+    resp = requests.get(url, params=params, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if payload.get("status") == "error" or "values" not in payload:
+        raise ValueError(
+            f"Twelve Data error: {payload.get('message', 'unknown error')}"
+        )
+
+    df = pd.DataFrame(payload["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df.set_index("datetime", inplace=True)
+    df.sort_index(inplace=True)
+
+    df = df.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
 def fetch_stock_data(
     ticker: str,
     start_date: str,
     end_date: str,
     max_retries: int = 3,
 ) -> pd.DataFrame:
-    """Download historical OHLCV data from Yahoo Finance.
+    """Download historical OHLCV data.
 
-    yfinance (>=0.2.41) automatically uses curl_cffi's browser-impersonating
-    HTTP client internally if the package is installed — it manages its own
-    cookies/crumb token for Yahoo's auth handshake. We deliberately do NOT
-    pass a custom session here: doing so bypasses yfinance's internal
-    crumb management and causes empty/invalid JSON responses from Yahoo.
+    Tries Twelve Data first if a ``TWELVEDATA_API_KEY`` environment
+    variable is set (reliable on cloud hosts), then falls back to
+    Yahoo Finance via yfinance (works well locally, but is frequently
+    blocked on cloud/datacenter IPs regardless of TLS impersonation).
 
     Parameters
     ----------
@@ -59,7 +107,7 @@ def fetch_stock_data(
     end_date : str
         Exclusive end date, ``"YYYY-MM-DD"`` format.
     max_retries : int
-        Number of attempts before giving up.
+        Number of yfinance attempts before giving up.
 
     Returns
     -------
@@ -69,27 +117,36 @@ def fetch_stock_data(
     Raises
     ------
     ValueError
-        If yfinance returns an empty DataFrame after all retries.
+        If no data source returns data.
     """
     print(f"[data] Downloading {ticker} from {start_date} to {end_date}...")
 
     df = pd.DataFrame()
     last_err = None
 
-    for attempt in range(1, max_retries + 1):
+    api_key = os.environ.get("TWELVEDATA_API_KEY")
+    if api_key:
         try:
-            tk = yf.Ticker(ticker)
-            df = tk.history(start=start_date, end=end_date, auto_adjust=True)
-            if not df.empty:
-                break
-
+            df = _fetch_from_twelvedata(ticker, start_date, end_date, api_key)
         except Exception as e:
+            print(f"[data] Twelve Data failed: {e}")
             last_err = e
 
-        if attempt < max_retries:
-            wait = 3 * attempt
-            print(f"[data] Attempt {attempt} failed, retrying in {wait}s...")
-            time.sleep(wait)
+    if df.empty:
+        for attempt in range(1, max_retries + 1):
+            try:
+                tk = yf.Ticker(ticker)
+                df = tk.history(start=start_date, end=end_date, auto_adjust=True)
+                if not df.empty:
+                    break
+
+            except Exception as e:
+                last_err = e
+
+            if attempt < max_retries:
+                wait = 3 * attempt
+                print(f"[data] Attempt {attempt} failed, retrying in {wait}s...")
+                time.sleep(wait)
 
     if df.empty:
         msg = (
